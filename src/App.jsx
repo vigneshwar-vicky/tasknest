@@ -19,7 +19,7 @@ import { sendTaskExpiredEmail } from "./emailService";
 // ─── Constants ────────────────────────────────────────────────────────────────
 const APP_VERSION = "1.3.0";
 const GEMINI_KEY = import.meta.env.VITE_GEMINI;
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${GEMINI_KEY}`;
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`;
 const FEEDBACK_EMAIL = "tasknest.application@gmail.com";
 
 const PRIORITY_DEFAULTS = { high: 60, medium: 240, low: 480 };
@@ -179,7 +179,6 @@ export default function App() {
   const [chatLoading, setChatLoading] = useState(false);
   const chatEndRef                  = useRef();
   const chatInputRef                = useRef();
-  const lastChatTime                = useRef(0);
 
   useEffect(() => {
     localStorage.setItem("tn_theme", darkMode ? "dark" : "light");
@@ -299,56 +298,37 @@ export default function App() {
   const handleChatSend = async (quickMsg) => {
     const msg = (quickMsg !== undefined ? quickMsg : chatInput).trim();
     if (!msg || chatLoading) return;
-
-    // Rate limit: 4 seconds between requests (free tier = 15 RPM)
-    const now = Date.now();
-    const elapsed = now - lastChatTime.current;
-    if (elapsed < 4000) {
-      const wait = Math.ceil((4000 - elapsed) / 1000);
-      setChatMsgs((prev) => [...prev, {
-        role: "ai",
-        text: "⏳ Please wait " + wait + " second" + (wait > 1 ? "s" : "") + " before sending another message.",
-      }]);
-      return;
-    }
-    lastChatTime.current = now;
-
     setChatInput("");
     setChatMsgs((prev) => [...prev, { role: "user", text: msg }]);
     setChatLoading(true);
-
     try {
-      const active   = todos.filter((t) => t.status === "new" || t.status === "inprogress");
-      const done     = todos.filter((t) => t.status === "completed" && t.createdDate === today());
-      const expired  = todos.filter((t) => t.status === "expired");
-
-      const taskList = todos.length === 0
-        ? "No tasks yet."
-        : todos.map((t) =>
-            "• [" + t.status.toUpperCase() + "][" + (t.priority || "medium").toUpperCase() + "] "
-            + t.activity + " | Est:" + t.estimateTime + "min"
-            + " Start:" + (t.startTime || "-") + " End:" + (t.endTime || "-")
+      const active  = todos.filter((t) => t.status === "new" || t.status === "inprogress");
+      const done    = todos.filter((t) => t.status === "completed" && t.createdDate === today());
+      const expired = todos.filter((t) => t.status === "expired");
+      const taskList = todos.length === 0 ? "No tasks yet."
+        : todos.map((t) => "• [" + t.status.toUpperCase() + "]["
+            + (t.priority||"medium").toUpperCase() + "] " + t.activity
+            + " Est:" + t.estimateTime + "min"
+            + " Start:" + (t.startTime||"-") + " End:" + (t.endTime||"-")
           ).join("\n");
 
-      const taskJsonExample = JSON.stringify({
-        action: "create_task", activity: "Task name",
-        priority: "high", estimateTime: "60",
-        startTime: "09:00", endTime: "10:00", comments: ""
+      const eg = JSON.stringify({
+        action:"create_task", activity:"Task name",
+        priority:"high", estimateTime:"60",
+        startTime:"09:00", endTime:"10:00", comments:""
       });
 
       const prompt =
-        "You are TaskNest AI, a smart task management assistant. "
-        + "User: " + (userProfile?.firstName || "User") + ". Today: " + today() + ".\n\n"
-        + "TASKS:\n" + taskList + "\n\n"
-        + "STATS: Active=" + active.length + " Done=" + done.length + " Expired=" + expired.length + "\n\n"
+        "You are TaskNest AI. User: " + (userProfile?.firstName||"User") + ". Today: " + today() + ".\n"
+        + "TASKS:\n" + taskList + "\n"
+        + "STATS: Active=" + active.length + " Done=" + done.length + " Expired=" + expired.length + "\n"
         + "RULES:\n"
-        + "1. Answer task questions helpfully and intelligently.\n"
-        + "2. To CREATE a task respond with ONLY this JSON (nothing else):\n"
-        + taskJsonExample + "\n"
+        + "1. Answer task questions helpfully.\n"
+        + "2. To CREATE a task reply ONLY with this JSON (no other text):\n" + eg + "\n"
         + "3. Time: 9am=09:00 2pm=14:00 10pm=22:00. No time = empty string.\n"
-        + "4. Priority defaults: high=60min medium=240min low=480min.\n"
-        + "5. All other queries: max 80 words, friendly and concise.\n\n"
-        + "User says: " + msg;
+        + "4. Priority: high=60min medium=240min low=480min.\n"
+        + "5. Other queries: max 80 words, friendly.\n"
+        + "User: " + msg;
 
       const res = await fetch(GEMINI_URL, {
         method: "POST",
@@ -358,14 +338,15 @@ export default function App() {
           generationConfig: { maxOutputTokens: 300, temperature: 0.7 },
         }),
       });
-
       const data = await res.json();
 
       if (data.error) {
-        const msg429 = data.error.code === 429 || (data.error.message || "").includes("quota")
-          ? "⏳ Rate limit reached. Please wait 30 seconds and try again. (Free tier: 15 requests/min)"
-          : "⚠️ " + (data.error.message || "API error");
-        setChatMsgs((prev) => [...prev, { role: "ai", text: msg429 }]);
+        const isQuota = data.error.code === 429 || (data.error.message||"").includes("quota");
+        setChatMsgs((prev) => [...prev, { role: "ai",
+          text: isQuota
+            ? "⏳ Rate limit reached. Please wait 30 seconds and try again."
+            : "⚠️ " + (data.error.message || "API error. Try again.")
+        }]);
         return;
       }
 
@@ -375,7 +356,6 @@ export default function App() {
         return;
       }
 
-      // Detect task creation JSON
       const jm = reply.trim().match(/\{[\s\S]*?\}/);
       if (jm) {
         try {
@@ -384,22 +364,15 @@ export default function App() {
             const conflict = checkConflict(p, todos);
             if (conflict) {
               setChatMsgs((prev) => [...prev, { role: "ai",
-                text: "⚠️ Time conflict with \"" + conflict.activity + "\" ("
-                  + conflict.startTime + "–" + conflict.endTime + "). Choose a different time!"
+                text: "⚠️ Conflict with \"" + conflict.activity + "\" (" + conflict.startTime + "–" + conflict.endTime + "). Choose a different time!"
               }]);
             } else {
               const newTodo = {
-                activity:     p.activity,
-                priority:     p.priority     || "medium",
-                status:       "new",
-                estimateTime: p.estimateTime || String(PRIORITY_DEFAULTS[p.priority || "medium"]),
-                startTime:    p.startTime    || "",
-                endTime:      p.endTime      || "",
-                actualTime:   "",
-                comments:     p.comments     || "",
-                id:           genId(),
-                createdDate:  today(),
-                createdAt:    new Date().toISOString(),
+                activity: p.activity, priority: p.priority||"medium", status: "new",
+                estimateTime: p.estimateTime||String(PRIORITY_DEFAULTS[p.priority||"medium"]),
+                startTime: p.startTime||"", endTime: p.endTime||"",
+                actualTime: "", comments: p.comments||"",
+                id: genId(), createdDate: today(), createdAt: new Date().toISOString(),
               };
               await saveTodos([...todos, newTodo]);
               setChatMsgs((prev) => [...prev, { role: "ai",
@@ -414,11 +387,9 @@ export default function App() {
           }
         } catch (_) {}
       }
-
       setChatMsgs((prev) => [...prev, { role: "ai", text: reply }]);
-
-    } catch (err) {
-      setChatMsgs((prev) => [...prev, { role: "ai", text: "⚠️ Network error. Please check your connection." }]);
+    } catch {
+      setChatMsgs((prev) => [...prev, { role: "ai", text: "⚠️ Network error. Try again." }]);
     } finally {
       setChatLoading(false);
     }
