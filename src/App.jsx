@@ -303,7 +303,6 @@ export default function App() {
     setChatLoading(true);
 
     try {
-      // Build live task context
       const activeTodos    = todos.filter((t) => t.status === "new" || t.status === "inprogress");
       const completedToday = todos.filter((t) => t.status === "completed" && t.createdDate === today());
       const expiredList    = todos.filter((t) => t.status === "expired");
@@ -316,19 +315,30 @@ export default function App() {
             " | Start:" + (t.startTime || "-") + " End:" + (t.endTime || "-")
           ).join("\n");
 
+      const jsonExample = JSON.stringify({
+        action: "create_task",
+        activity: "Task name",
+        priority: "high",
+        estimateTime: "60",
+        startTime: "09:00",
+        endTime: "10:00",
+        comments: "",
+      });
+
       const prompt =
         "You are TaskNest AI, a helpful task management assistant. " +
         "User: " + (userProfile?.firstName || "User") + ". Today: " + today() + ".\n\n" +
         "CURRENT TASKS:\n" + taskList + "\n\n" +
-        "STATS: Active=" + activeTodos.length + " Completed today=" + completedToday.length + " Expired=" + expiredList.length + "\n\n" +
-        "RULES:\n" +
-        "- Answer task questions clearly and helpfully.\n" +
-        "- To CREATE a task: respond with ONLY JSON like this (no extra text):\n" +
-        "{"action":"create_task","activity":"Task name","priority":"high","estimateTime":"60","startTime":"09:00","endTime":"10:00","comments":""}\n" +
-        "- Time format: 9am=09:00, 2pm=14:00, 10pm=22:00\n" +
-        "- Priority defaults: high=60min medium=240min low=480min\n" +
-        "- If no time given, set startTime and endTime to empty string ""\n" +
-        "- For non-create queries: reply in max 80 words, be smart and concise.\n\n" +
+        "STATS: Active=" + activeTodos.length +
+        " | Completed today=" + completedToday.length +
+        " | Expired=" + expiredList.length + "\n\n" +
+        "INSTRUCTIONS:\n" +
+        "1. Answer task questions clearly and helpfully.\n" +
+        "2. To CREATE a task respond with ONLY this JSON and nothing else:\n" +
+        jsonExample + "\n" +
+        "3. Time: 9am=09:00, 2pm=14:00, 10pm=22:00. No time given = leave startTime and endTime empty.\n" +
+        "4. Priority defaults: high=60min, medium=240min, low=480min.\n" +
+        "5. For all other queries be concise, smart, max 80 words.\n\n" +
         "User says: " + msg;
 
       const res = await fetch(GEMINI_URL, {
@@ -343,18 +353,24 @@ export default function App() {
       const data = await res.json();
 
       if (data.error) {
-        setChatMsgs((prev) => [...prev, { role: "ai", text: "⚠️ API Error: " + data.error.message }]);
+        setChatMsgs((prev) => [...prev, {
+          role: "ai",
+          text: "⚠️ API Error: " + data.error.message,
+        }]);
         return;
       }
 
       const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
 
       if (!reply) {
-        setChatMsgs((prev) => [...prev, { role: "ai", text: "⚠️ Empty response from AI. Please try again." }]);
+        setChatMsgs((prev) => [...prev, {
+          role: "ai",
+          text: "⚠️ No response from AI. Please try again.",
+        }]);
         return;
       }
 
-      // Detect task creation JSON
+      // Detect task creation JSON in reply
       const jsonMatch = reply.trim().match(/\{[\s\S]*?\}/);
       if (jsonMatch) {
         try {
@@ -393,13 +409,16 @@ export default function App() {
             }
             return;
           }
-        } catch (_) { /* not task JSON */ }
+        } catch (_) { /* not task JSON, show as normal reply */ }
       }
 
       setChatMsgs((prev) => [...prev, { role: "ai", text: reply }]);
 
     } catch (err) {
-      setChatMsgs((prev) => [...prev, { role: "ai", text: "⚠️ Network error. Please check your connection." }]);
+      setChatMsgs((prev) => [...prev, {
+        role: "ai",
+        text: "⚠️ Network error. Please check your connection and try again.",
+      }]);
     } finally {
       setChatLoading(false);
     }
