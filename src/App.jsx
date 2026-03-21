@@ -295,100 +295,156 @@ export default function App() {
     }
   }, [chatMsgs, chatOpen]);
 
-  const buildSystemPrompt = () => {
-    const activeTodos = todos.filter((t) => t.status === "new" || t.status === "inprogress");
-    const completedToday = todos.filter((t) => t.status === "completed" && t.createdDate === today());
-    const expired = todos.filter((t) => t.status === "expired");
-    const high = todos.filter((t) => t.priority === "high" && (t.status === "new" || t.status === "inprogress"));
-    return `You are a smart AI assistant embedded in TaskNest, a todo app. The user is ${userProfile?.firstName} ${userProfile?.lastName}.
-
-CURRENT TASKS (today: ${today()}):
-${todos.length === 0 ? "No tasks yet." : todos.map((t) => `- [${t.status.toUpperCase()}][${(t.priority || "medium").toUpperCase()}] "${t.activity}" | Est: ${t.estimateTime}mins | Start: ${t.startTime || "N/A"} | End: ${t.endTime || "N/A"} | ID: ${t.id}`).join("\n")}
-
-SUMMARY: ${activeTodos.length} active, ${completedToday.length} completed today, ${expired.length} expired, ${high.length} high priority pending.
-
-CAPABILITIES:
-1. Answer questions about tasks
-2. Summarize productivity
-3. Create tasks by responding with JSON
-
-TASK CREATION: When user wants to create a task, respond with ONLY this JSON (no other text):
-{"action":"create_task","activity":"task name","priority":"high|medium|low","status":"new","estimateTime":"60","startTime":"09:00","endTime":"10:00","comments":""}
-
-Rules for task creation:
-- Parse natural language for time (e.g. "9am" = "09:00", "2:30pm" = "14:30")  
-- If no time given, leave startTime and endTime as ""
-- If no priority given, default to "medium"
-- estimateTime in minutes: high=60, medium=240, low=480 unless specified
-- Only return the JSON, nothing else, when creating a task
-
-For all other queries, respond in a friendly, concise way. Use emojis sparingly. Keep responses under 150 words.`;
-  };
-
-  const handleChatSend = async () => {
-    const msg = chatInput.trim();
+  const handleChatSend = async (quickMsg) => {
+    const msg = (quickMsg !== undefined ? quickMsg : chatInput).trim();
     if (!msg || chatLoading) return;
     setChatInput("");
-    setChatMsgs((prev) => [...prev, { role: "user", text: msg }]);
+
+    const userMsg = { role: "user", text: msg };
+    setChatMsgs((prev) => [...prev, userMsg]);
     setChatLoading(true);
+
     try {
-      const history = chatMsgs
-        .filter((m) => m.role !== "ai" || chatMsgs.indexOf(m) > 0)
-        .map((m) => ({
-          role: m.role === "user" ? "user" : "model",
-          parts: [{ text: m.text }],
-        }));
+      // Build task list context
+      const activeTodos    = todos.filter((t) => t.status === "new" || t.status === "inprogress");
+      const completedToday = todos.filter((t) => t.status === "completed" && t.createdDate === today());
+      const expiredTodos   = todos.filter((t) => t.status === "expired");
+
+      const taskList = todos.length === 0
+        ? "No tasks yet."
+        : todos.map((t) =>
+            "- [" + t.status.toUpperCase() + "][" + (t.priority || "medium").toUpperCase() + '] "' + t.activity + '" | ' +
+            "Est:" + t.estimateTime + "mins | " +
+            "Start:" + (t.startTime || "none") + " | End:" + (t.endTime || "none")
+          ).join("\n");
+
+      const systemText =
+        "You are TaskNest AI, an intelligent task management assistant. " +
+        "The user is " + (userProfile?.firstName || "User") + " " + (userProfile?.lastName || "") + ". " +
+        "Today is " + today() + ".\n\n" +
+        "TASKS:\n" + taskList + "\n\n" +
+        "STATS: " + activeTodos.length + " active, " + completedToday.length + " completed today, " + expiredTodos.length + " expired.\n\n" +
+        "INSTRUCTIONS:\n" +
+        "1. Answer questions about tasks clearly and helpfully.\n" +
+        "2. When user wants to CREATE a task, respond with ONLY this JSON and nothing else:\n" +
+        '{"action":"create_task","activity":"TASK NAME","priority":"high","estimateTime":"60","startTime":"09:00","endTime":"10:00","comments":""}\n' +
+        "3. Time parsing: 9am=09:00, 2pm=14:00, 10pm=22:00, 9:30am=09:30.\n" +
+        "4. If no time given, set startTime and endTime to empty string.\n" +
+        "5. Priority: high(60min), medium(240min), low(480min). Default=medium.\n" +
+        "6. For all other messages, be friendly, concise and smart. Max 100 words.";
+
+      // Build conversation - Gemini needs strict alternating user/model
+      // Use simple single-turn approach: system + user question in one message
+      const fullUserMsg = systemText + "\n\nUser message: " + msg;
+
+      const payload = {
+        contents: [
+          { role: "user", parts: [{ text: fullUserMsg }] }
+        ],
+        generationConfig: {
+          maxOutputTokens: 400,
+          temperature: 0.7,
+          topP: 0.9,
+        },
+        safetySettings: [
+          { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+          { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+          { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+          { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" },
+        ],
+      };
+
       const res = await fetch(GEMINI_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          system_instruction: { parts: [{ text: buildSystemPrompt() }] },
-          contents: [...history, { role: "user", parts: [{ text: msg }] }],
-          generationConfig: { maxOutputTokens: 400, temperature: 0.7 },
-        }),
+        body: JSON.stringify(payload),
       });
-      const data = await res.json();
-      const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text || "Sorry, I couldn't understand that. Try again!";
 
-      // Check if AI wants to create a task
+      const data = await res.json();
+
+      // Check for API errors
+      if (data.error) {
+        console.error("Gemini error:", data.error);
+        setChatMsgs((prev) => [...prev, {
+          role: "ai",
+          text: "⚠️ API Error: " + data.error.message + "\nPlease check your Gemini API key.",
+        }]);
+        return;
+      }
+
+      const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+      if (!reply) {
+        setChatMsgs((prev) => [...prev, {
+          role: "ai",
+          text: "⚠️ No response received. The API may be rate-limited. Please wait a moment and try again.",
+        }]);
+        return;
+      }
+
+      // Check if response is a task creation JSON
       const trimmed = reply.trim();
-      if (trimmed.startsWith("{") && trimmed.includes("action") && trimmed.includes("create_task")) {
+      const jsonMatch = trimmed.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
         try {
-          const parsed = JSON.parse(trimmed);
+          const parsed = JSON.parse(jsonMatch[0]);
           if (parsed.action === "create_task" && parsed.activity) {
             const conflict = checkConflict(parsed, todos);
             if (conflict) {
-              setChatMsgs((prev) => [...prev, { role: "ai", text: `⚠️ I couldn't create the task because it conflicts with "${conflict.activity}" (${conflict.startTime} – ${conflict.endTime}). Please choose a different time!` }]);
+              setChatMsgs((prev) => [...prev, {
+                role: "ai",
+                text:
+                  "⚠️ Cannot create task — time conflict with \"" + conflict.activity + "\" " +
+                  "(" + conflict.startTime + " – " + conflict.endTime + ").\n" +
+                  "Please choose a different time slot!",
+              }]);
             } else {
               const newTodo = {
                 activity:     parsed.activity,
-                priority:     parsed.priority || "medium",
+                priority:     parsed.priority    || "medium",
                 status:       "new",
                 estimateTime: parsed.estimateTime || String(PRIORITY_DEFAULTS[parsed.priority || "medium"]),
-                startTime:    parsed.startTime || "",
-                endTime:      parsed.endTime || "",
+                startTime:    parsed.startTime   || "",
+                endTime:      parsed.endTime     || "",
                 actualTime:   "",
-                comments:     parsed.comments || "",
+                comments:     parsed.comments    || "",
                 id:           genId(),
                 createdDate:  today(),
                 createdAt:    new Date().toISOString(),
               };
               await saveTodos([...todos, newTodo]);
-              setChatMsgs((prev) => [...prev, { role: "ai", text: `✅ Task created successfully!\n\n📌 **${newTodo.activity}**\n🎯 Priority: ${PRIORITY_LABEL[newTodo.priority]}\n⏱ Estimate: ${newTodo.estimateTime} mins${newTodo.startTime ? `\n🕐 ${newTodo.startTime} – ${newTodo.endTime}` : ""}` }]);
+              setChatMsgs((prev) => [...prev, {
+                role: "ai",
+                text:
+                  "✅ Task created!\n\n" +
+                  "📌 " + newTodo.activity + "\n" +
+                  "🎯 Priority: " + PRIORITY_LABEL[newTodo.priority] + "\n" +
+                  "⏱ Estimate: " + newTodo.estimateTime + " mins" +
+                  (newTodo.startTime ? "\n🕐 " + newTodo.startTime + " – " + newTodo.endTime : "") +
+                  "\n\nCheck your Todo List!",
+              }]);
             }
             return;
           }
-        } catch { /* not valid JSON, treat as normal reply */ }
+        } catch (_) {
+          // Not task JSON — show as normal reply
+        }
       }
+
       setChatMsgs((prev) => [...prev, { role: "ai", text: reply }]);
-    } catch {
-      setChatMsgs((prev) => [...prev, { role: "ai", text: "⚠️ Something went wrong. Check your connection and try again." }]);
+
+    } catch (err) {
+      console.error("Chat fetch error:", err);
+      setChatMsgs((prev) => [...prev, {
+        role: "ai",
+        text: "⚠️ Connection error. Please check your internet and try again.",
+      }]);
     } finally {
       setChatLoading(false);
     }
   };
 
-
+  // ── Edit Account ──────────────────────────────────────────────────────────
   // ── Edit Account ──────────────────────────────────────────────────────────
   const openEditAcct = () => {
     setEditAcctForm({ firstName: userProfile?.firstName || "", lastName: userProfile?.lastName || "" });
@@ -953,8 +1009,8 @@ For all other queries, respond in a friendly, concise way. Use emojis sparingly.
               </div>
 
               <div className="chat-suggestions">
-                {["What are my tasks today?", "Show high priority tasks", "Summarize my day"].map((s) => (
-                  <button key={s} className="chat-suggestion" onClick={() => { const msg = s; setChatMsgs((prev) => [...prev, { role: "user", text: msg }]); setChatInput(""); setChatLoading(true); fetch(GEMINI_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ system_instruction: { parts: [{ text: buildSystemPrompt() }] }, contents: [{ role: "user", parts: [{ text: msg }] }], generationConfig: { maxOutputTokens: 400, temperature: 0.7 } }) }).then(r => r.json()).then(data => { const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text || "Sorry, I could not understand that."; setChatMsgs((prev) => [...prev, { role: "ai", text: reply }]); }).catch(() => setChatMsgs((prev) => [...prev, { role: "ai", text: "Connection error. Please try again." }])).finally(() => setChatLoading(false)); }}>
+                {["What are my tasks today?", "Show high priority tasks", "Summarize my day", "Create a task for me"].map((s) => (
+                  <button key={s} className="chat-suggestion" onClick={() => handleChatSend(s)}>
                     {s}
                   </button>
                 ))}
@@ -966,11 +1022,11 @@ For all other queries, respond in a friendly, concise way. Use emojis sparingly.
                   className="chat-input"
                   value={chatInput}
                   onChange={(e) => setChatInput(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && handleChatSend()}
+                  onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && handleChatSend(undefined)}
                   placeholder="Ask me anything or create a task..."
                   disabled={chatLoading}
                 />
-                <button className="chat-send" onClick={handleChatSend} disabled={chatLoading || !chatInput.trim()}>
+                <button className="chat-send" onClick={() => handleChatSend(undefined)} disabled={chatLoading || !chatInput.trim()}>
                   ➤
                 </button>
               </div>
@@ -1154,57 +1210,19 @@ body { font-family: 'Lato', sans-serif; }
 .hc-activity{font-family:'Caveat',cursive;font-size:1.1rem;font-weight:700;color:var(--ink);margin-bottom:6px}
 
 /* TimePicker */
-.tp-wrap{position:relative}
-.tp-field{display:flex;align-items:center;border:2px solid rgba(139,99,64,0.25);border-radius:10px;background:#fff;cursor:pointer;transition:border-color 0.2s}
-.tp-field:hover{border-color:var(--accent2)}
-.tp-clock{padding:10px 10px 10px 12px;font-size:1rem;color:#5C4033}
-.tp-input{flex:1;border:none!important;background:transparent!important;cursor:pointer;padding:10px 14px 10px 0!important;color:#2C1810;font-family:Lato,sans-serif;font-size:0.95rem}
-.tp-popup{position:absolute;top:110%;left:0;background:#FDFAF2;border-radius:14px;padding:18px;box-shadow:0 8px 32px rgba(0,0,0,0.25);z-index:400;min-width:220px;border:1px solid rgba(139,99,64,0.2)}
-.tp-title{font-family:'Caveat',cursive;font-size:1.05rem;color:#2C1810;margin-bottom:12px}
-.tp-row{display:flex;align-items:center;gap:8px;margin-bottom:12px}
-.tp-row button{background:rgba(139,99,64,0.12);border:none;border-radius:6px;width:28px;height:28px;cursor:pointer;font-size:1rem;color:#5C4033;transition:background 0.15s}
-.tp-row button:hover{background:rgba(139,99,64,0.25)}
-.tp-num{width:46px;text-align:center;border:2px solid rgba(139,99,64,0.2);border-radius:8px;padding:4px;font-size:1rem;font-weight:700;color:#2C1810;background:#fff}
-.tp-num:focus{outline:none;border-color:var(--accent2)}
-.tp-colon{font-size:1.3rem;font-weight:700;color:#5C4033}
-.tp-ampm{display:flex;gap:8px;margin-bottom:12px}
-.tp-ampm button{flex:1;padding:7px;border:2px solid rgba(139,99,64,0.2);border-radius:8px;background:transparent;cursor:pointer;font-weight:700;color:#5C4033;transition:all 0.15s}
-.tp-ampm button.active{background:var(--accent2);color:#fff;border-color:var(--accent2)}
-.tp-ok{width:100%;padding:9px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;border:none;border-radius:10px;cursor:pointer;font-weight:700;font-family:Lato,sans-serif;transition:opacity 0.15s}
-.tp-ok:hover{opacity:0.9}
-/* TimePicker dark mode */
-.dark .tp-field{background:#2a2a3e;border-color:rgba(200,180,160,0.3)}
-.dark .tp-field:hover{border-color:var(--accent2)}
-.dark .tp-clock{color:#c0a890}
-.dark .tp-input{color:#e8e0d0}
-.dark .tp-popup{background:#2a2a3e;border-color:rgba(200,180,160,0.2);box-shadow:0 8px 32px rgba(0,0,0,0.5)}
-.dark .tp-title{color:#f0e8d8}
-.dark .tp-row button{background:rgba(255,255,255,0.1);color:#c0a890}
-.dark .tp-row button:hover{background:rgba(255,255,255,0.2)}
-.dark .tp-num{background:#1e1e2e;color:#f0e8d8;border-color:rgba(200,180,160,0.3)}
-.dark .tp-colon{color:#c0a890}
-.dark .tp-ampm button{color:#c0a890;border-color:rgba(200,180,160,0.2)}
-.dark .tp-ampm button.active{background:var(--accent2);color:#fff}
+.tp-wrap{position:relative} .tp-field{display:flex;align-items:center;border:2px solid rgba(139,99,64,0.2);border-radius:10px;background:rgba(255,255,255,0.8);cursor:pointer;transition:border-color 0.2s} .tp-field:hover{border-color:var(--accent2)}
+.tp-clock{padding:10px 10px 10px 12px;font-size:1rem} .tp-input{flex:1;border:none!important;background:transparent!important;cursor:pointer;padding:10px 14px 10px 0!important;color:var(--ink)}
+.tp-popup{position:absolute;top:110%;left:0;background:var(--paper);border-radius:14px;padding:18px;box-shadow:0 8px 32px rgba(0,0,0,0.25);z-index:300;min-width:220px;border:1px solid rgba(139,99,64,0.15)}
+.tp-title{font-family:'Caveat',cursive;font-size:1.05rem;color:var(--ink);margin-bottom:12px}
+.tp-row{display:flex;align-items:center;gap:8px;margin-bottom:12px} .tp-row button{background:rgba(139,99,64,0.1);border:none;border-radius:6px;width:28px;height:28px;cursor:pointer;font-size:1rem;color:var(--ink2);transition:background 0.15s} .tp-row button:hover{background:rgba(139,99,64,0.22)}
+.tp-num{width:46px;text-align:center;border:2px solid rgba(139,99,64,0.2);border-radius:8px;padding:4px;font-size:1rem;font-weight:700;color:var(--ink);background:white} .tp-num:focus{outline:none;border-color:var(--accent2)}
+.tp-colon{font-size:1.3rem;font-weight:700;color:var(--ink2)} .tp-ampm{display:flex;gap:8px;margin-bottom:12px}
+.tp-ampm button{flex:1;padding:7px;border:2px solid rgba(139,99,64,0.2);border-radius:8px;background:transparent;cursor:pointer;font-weight:700;color:var(--ink2);transition:all 0.15s} .tp-ampm button.active{background:var(--accent2);color:white;border-color:var(--accent2)}
+.tp-ok{width:100%;padding:9px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:white;border:none;border-radius:10px;cursor:pointer;font-weight:700;font-family:'Lato',sans-serif;transition:opacity 0.15s} .tp-ok:hover{opacity:0.9}
 
-/* Toast - fixed colors for both light and dark themes */
-.toast{
-  position:fixed;bottom:28px;right:28px;
-  background:#1a0f0a;
-  color:#F5EDD8;
-  padding:14px 22px;border-radius:14px;
-  font-size:0.9rem;font-weight:600;font-family:Lato,sans-serif;
-  z-index:9999;
-  box-shadow:0 8px 28px rgba(0,0,0,0.45);
-  animation:slideUp 0.3s ease;
-  border-left:4px solid #27AE60;
-  max-width:400px;line-height:1.55;
-  word-break:break-word;
-}
-.toast.error{border-left-color:#e74c3c;background:#1a0505;color:#ffeaea}
-.toast.warning{border-left-color:#f5a623;background:#1a1005;color:#fff3d0}
-.dark .toast{background:#0d0d1a;color:#e8e0d0;box-shadow:0 8px 28px rgba(0,0,0,0.7)}
-.dark .toast.error{background:#1a0505;color:#ffc5c5}
-.dark .toast.warning{background:#1a1200;color:#ffe5a0}
+/* Toast */
+.toast{position:fixed;bottom:28px;right:28px;background:var(--ink);color:var(--cream);padding:13px 22px;border-radius:12px;font-size:0.9rem;font-weight:600;z-index:999;box-shadow:0 6px 24px rgba(0,0,0,0.35);animation:slideUp 0.3s ease;border-left:4px solid var(--green);max-width:380px;line-height:1.5}
+.toast.error{border-left-color:#e74c3c}
 @keyframes slideUp{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
 
 /* Scrollbar */
@@ -1229,19 +1247,17 @@ body { font-family: 'Lato', sans-serif; }
 .chat-msg-avatar{font-size:1.2rem;flex-shrink:0}
 .chat-msg-bubble{max-width:80%;padding:10px 14px;border-radius:16px;font-size:0.88rem;line-height:1.5;word-break:break-word}
 .chat-msg.ai .chat-msg-bubble{background:rgba(139,99,64,0.1);color:var(--ink);border-bottom-left-radius:4px}
-.dark .chat-msg.ai .chat-msg-bubble{background:rgba(255,255,255,0.1);color:#e8e0d0}
+.dark .chat-msg.ai .chat-msg-bubble{background:rgba(255,255,255,0.08);color:var(--ink)}
 .chat-msg.user .chat-msg-bubble{background:linear-gradient(135deg,var(--accent),var(--accent2));color:white;border-bottom-right-radius:4px}
 .chat-typing{display:flex;gap:5px;align-items:center;padding:12px 14px}
 .chat-typing span{width:7px;height:7px;border-radius:50%;background:var(--ink2);animation:bounce 1.2s ease infinite}
 .chat-typing span:nth-child(2){animation-delay:.2s}.chat-typing span:nth-child(3){animation-delay:.4s}
 .chat-suggestions{padding:8px 12px;display:flex;gap:6px;flex-wrap:wrap;flex-shrink:0;border-top:1px solid rgba(139,99,64,0.1)}
-.chat-suggestion{background:rgba(139,99,64,0.1);border:1px solid rgba(139,99,64,0.25);border-radius:20px;padding:5px 12px;font-size:0.75rem;cursor:pointer;color:#5C4033;font-family:Lato,sans-serif;transition:all 0.15s;white-space:nowrap}
-.dark .chat-suggestion{background:rgba(255,255,255,0.08);border-color:rgba(255,255,255,0.15);color:#c0a890}
-.dark .chat-suggestion:hover{background:rgba(255,255,255,0.15);color:#e8e0d0}
+.chat-suggestion{background:rgba(139,99,64,0.08);border:1px solid rgba(139,99,64,0.2);border-radius:20px;padding:5px 12px;font-size:0.75rem;cursor:pointer;color:var(--ink2);font-family:Lato,sans-serif;transition:all 0.15s;white-space:nowrap}
 .chat-suggestion:hover{background:rgba(139,99,64,0.18);color:var(--ink)}
 .chat-input-row{display:flex;gap:8px;padding:12px;border-top:1px solid rgba(139,99,64,0.1);flex-shrink:0}
 .chat-input{flex:1;padding:10px 14px;border:2px solid rgba(139,99,64,0.2);border-radius:12px;font-family:Lato,sans-serif;font-size:0.9rem;background:rgba(255,255,255,0.8);color:var(--ink);outline:none;transition:border-color 0.2s}
-.dark .chat-input{background:rgba(255,255,255,0.08);color:#e8e0d0;border-color:rgba(200,180,160,0.3)}
+.dark .chat-input{background:rgba(255,255,255,0.08);color:var(--ink)}
 .chat-input:focus{border-color:var(--accent2)}
 .chat-send{background:linear-gradient(135deg,var(--accent),var(--accent2));border:none;border-radius:12px;width:42px;height:42px;cursor:pointer;color:white;font-size:1rem;flex-shrink:0;transition:opacity 0.15s;display:flex;align-items:center;justify-content:center}
 .chat-send:hover{opacity:0.85}
