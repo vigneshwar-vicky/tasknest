@@ -17,7 +17,9 @@ import { auth, db } from "./firebase";
 import { sendTaskExpiredEmail } from "./emailService";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-const APP_VERSION = "1.2.0";
+const APP_VERSION = "1.4.0";
+const GEMINI_KEY = "AIzaSyBecGIhzM22sfDXMQ-2ZD8NDmgJRqx43MA";
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`;
 const FEEDBACK_EMAIL = "tasknest.application@gmail.com";
 
 const PRIORITY_DEFAULTS = { high: 60, medium: 240, low: 480 };
@@ -170,6 +172,14 @@ export default function App() {
   const [feedbackText, setFeedbackText] = useState("");
   const [feedbackSending, setFeedbackSending] = useState(false);
 
+  // Chat bot
+  const [chatOpen, setChatOpen]     = useState(false);
+  const [chatMsgs, setChatMsgs]     = useState([{ role: "ai", text: "Hi! I'm your TaskNest AI assistant 🤖\nI can help you:\n• View and filter your tasks\n• Create new tasks\n• Summarize your day\n\nTry asking: Create a task for code review, high priority, 9am to 10am" }]);
+  const [chatInput, setChatInput]   = useState("");
+  const [chatLoading, setChatLoading] = useState(false);
+  const chatEndRef                  = useRef();
+  const chatInputRef                = useRef();
+
   useEffect(() => {
     localStorage.setItem("tn_theme", darkMode ? "dark" : "light");
   }, [darkMode]);
@@ -214,26 +224,65 @@ export default function App() {
     return unsub;
   }, [authUser]);
 
-  // ── Expiry checker ────────────────────────────────────────────────────────
+  // ── Notification + Expiry checker ────────────────────────────────────────
   useEffect(() => {
     if (!authUser || !userProfile) return;
     const check = async () => {
       const snap = await getDoc(doc(db, "todos", authUser.uid));
       if (!snap.exists()) return;
       const items = snap.data().items || [];
-      const now = new Date();
+      const now  = new Date();
+      const nowM = now.getHours() * 60 + now.getMinutes();
       let changed = false;
+
       const updated = items.map((t) => {
-        if ((t.status === "new" || t.status === "inprogress") && t.endTime) {
-          const end = new Date(`${today()}T${t.endTime}`);
-          if (now > end) {
-            changed = true;
-            sendTaskExpiredEmail(authUser.email, userProfile.firstName, t.activity);
-            return { ...t, status: "expired", comments: (t.comments || "") + (t.comments ? "\n" : "") + "Task not completed on time" };
+        if ((t.status === "new" || t.status === "inprogress") && t.createdDate === today()) {
+          let task = { ...t };
+
+          // 1. Task start email
+          if (t.startTime && !t.notifiedStart) {
+            const startM = timeToMins(t.startTime);
+            if (startM !== null && nowM >= startM) {
+              changed = true;
+              task.notifiedStart = true;
+              sendTaskExpiredEmail(
+                authUser.email,
+                userProfile.firstName,
+                "START: Your task \"" + t.activity + "\" is starting now (" + t.startTime + ")"
+              );
+            }
           }
+
+          // 2. 10-min end warning email
+          if (t.endTime && !t.notifiedEndWarning) {
+            const endM = timeToMins(t.endTime);
+            if (endM !== null && nowM >= endM - 10 && nowM < endM) {
+              changed = true;
+              task.notifiedEndWarning = true;
+              sendTaskExpiredEmail(
+                authUser.email,
+                userProfile.firstName,
+                "WARNING: Your task \"" + t.activity + "\" ends in 10 minutes (" + t.endTime + ")"
+              );
+            }
+          }
+
+          // 3. Task expired
+          if (t.endTime) {
+            const end = new Date(today() + "T" + t.endTime);
+            if (now > end && task.status !== "expired") {
+              changed = true;
+              task.status   = "expired";
+              task.comments = (t.comments || "") + (t.comments ? "\n" : "") + "Task not completed on time";
+              sendTaskExpiredEmail(authUser.email, userProfile.firstName, t.activity);
+            }
+          }
+
+          return task;
         }
         return t;
       });
+
       if (changed) await setDoc(doc(db, "todos", authUser.uid), { items: updated });
     };
     check();
@@ -278,6 +327,107 @@ export default function App() {
 
   const handleLogout = () => signOut(auth);
 
+  // ── AI Chatbot ────────────────────────────────────────────────────────────
+  useEffect(() => {
+    if (chatOpen && chatEndRef.current) {
+      chatEndRef.current.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [chatMsgs, chatOpen]);
+
+  const buildSystemPrompt = () => {
+    const activeTodos = todos.filter((t) => t.status === "new" || t.status === "inprogress");
+    const completedToday = todos.filter((t) => t.status === "completed" && t.createdDate === today());
+    const expired = todos.filter((t) => t.status === "expired");
+    const high = todos.filter((t) => t.priority === "high" && (t.status === "new" || t.status === "inprogress"));
+    return `You are a smart AI assistant embedded in TaskNest, a todo app. The user is ${userProfile?.firstName} ${userProfile?.lastName}.
+
+CURRENT TASKS (today: ${today()}):
+${todos.length === 0 ? "No tasks yet." : todos.map((t) => `- [${t.status.toUpperCase()}][${(t.priority || "medium").toUpperCase()}] "${t.activity}" | Est: ${t.estimateTime}mins | Start: ${t.startTime || "N/A"} | End: ${t.endTime || "N/A"} | ID: ${t.id}`).join("\n")}
+
+SUMMARY: ${activeTodos.length} active, ${completedToday.length} completed today, ${expired.length} expired, ${high.length} high priority pending.
+
+CAPABILITIES:
+1. Answer questions about tasks
+2. Summarize productivity
+3. Create tasks by responding with JSON
+
+TASK CREATION: When user wants to create a task, respond with ONLY this JSON (no other text):
+{"action":"create_task","activity":"task name","priority":"high|medium|low","status":"new","estimateTime":"60","startTime":"09:00","endTime":"10:00","comments":""}
+
+Rules for task creation:
+- Parse natural language for time (e.g. "9am" = "09:00", "2:30pm" = "14:30")  
+- If no time given, leave startTime and endTime as ""
+- If no priority given, default to "medium"
+- estimateTime in minutes: high=60, medium=240, low=480 unless specified
+- Only return the JSON, nothing else, when creating a task
+
+For all other queries, respond in a friendly, concise way. Use emojis sparingly. Keep responses under 150 words.`;
+  };
+
+  const handleChatSend = async () => {
+    const msg = chatInput.trim();
+    if (!msg || chatLoading) return;
+    setChatInput("");
+    setChatMsgs((prev) => [...prev, { role: "user", text: msg }]);
+    setChatLoading(true);
+    try {
+      const history = chatMsgs
+        .filter((m) => m.role !== "ai" || chatMsgs.indexOf(m) > 0)
+        .map((m) => ({
+          role: m.role === "user" ? "user" : "model",
+          parts: [{ text: m.text }],
+        }));
+      const res = await fetch(GEMINI_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          system_instruction: { parts: [{ text: buildSystemPrompt() }] },
+          contents: [...history, { role: "user", parts: [{ text: msg }] }],
+          generationConfig: { maxOutputTokens: 400, temperature: 0.7 },
+        }),
+      });
+      const data = await res.json();
+      const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text || "Sorry, I couldn't understand that. Try again!";
+
+      // Check if AI wants to create a task
+      const trimmed = reply.trim();
+      if (trimmed.startsWith("{") && trimmed.includes("action") && trimmed.includes("create_task")) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          if (parsed.action === "create_task" && parsed.activity) {
+            const conflict = checkConflict(parsed, todos);
+            if (conflict) {
+              setChatMsgs((prev) => [...prev, { role: "ai", text: `⚠️ I couldn't create the task because it conflicts with "${conflict.activity}" (${conflict.startTime} – ${conflict.endTime}). Please choose a different time!` }]);
+            } else {
+              const newTodo = {
+                activity:     parsed.activity,
+                priority:     parsed.priority || "medium",
+                status:       "new",
+                estimateTime: parsed.estimateTime || String(PRIORITY_DEFAULTS[parsed.priority || "medium"]),
+                startTime:    parsed.startTime || "",
+                endTime:      parsed.endTime || "",
+                actualTime:   "",
+                comments:     parsed.comments || "",
+                id:           genId(),
+                createdDate:  today(),
+                createdAt:    new Date().toISOString(),
+              };
+              await saveTodos([...todos, newTodo]);
+              setChatMsgs((prev) => [...prev, { role: "ai", text: `✅ Task created successfully!\n\n📌 **${newTodo.activity}**\n🎯 Priority: ${PRIORITY_LABEL[newTodo.priority]}\n⏱ Estimate: ${newTodo.estimateTime} mins${newTodo.startTime ? `\n🕐 ${newTodo.startTime} – ${newTodo.endTime}` : ""}` }]);
+            }
+            return;
+          }
+        } catch { /* not valid JSON, treat as normal reply */ }
+      }
+      setChatMsgs((prev) => [...prev, { role: "ai", text: reply }]);
+    } catch {
+      setChatMsgs((prev) => [...prev, { role: "ai", text: "⚠️ Something went wrong. Check your connection and try again." }]);
+    } finally {
+      setChatLoading(false);
+    }
+  };
+
+
   // ── Edit Account ──────────────────────────────────────────────────────────
   const openEditAcct = () => {
     setEditAcctForm({ firstName: userProfile?.firstName || "", lastName: userProfile?.lastName || "" });
@@ -311,7 +461,7 @@ export default function App() {
         {
           to_name:   "TaskNest Team",
           to_email:  FEEDBACK_EMAIL,
-          task_name: `Feedback from ${userProfile?.firstName} ${userProfile?.lastName}`,
+          task_name: `[FEEDBACK] From: ${userProfile?.firstName} ${userProfile?.lastName} (${authUser?.email}) | Message: ${feedbackText}`,
           message:   feedbackText,
         },
         "8GpnlxYEEPYtypCL0"
@@ -399,6 +549,7 @@ export default function App() {
   const [expanded, setExpanded] = useState({});
   const days = last7();
   const grouped = days.reduce((acc, d) => { acc[d] = todos.filter((t) => t.createdDate === d); return acc; }, {});
+  const todayTodos    = todos.filter((t) => t.createdDate === today());
   const daysWithTasks = [...days].reverse().filter((d) => grouped[d]?.length > 0 || d === today());
 
   // ── Loading ───────────────────────────────────────────────────────────────
@@ -625,16 +776,21 @@ export default function App() {
                   </div>
                 )}
 
-                {/* Todo Cards */}
+                {/* Todo Cards - today only */}
                 <div className="todos-grid">
-                  {todos.length === 0 && (
+                  {todayTodos.length === 0 && (
                     <div className="empty-state">
                       <div className="empty-icon">📝</div>
-                      <div>No tasks yet. Create your first task!</div>
+                      <div>No tasks for today. Create your first task!</div>
                     </div>
                   )}
-                  {todos.map((todo) => (
+                  {todayTodos.map((todo) => {
+                    const isExpired   = todo.status === "expired";
+                    const isCompleted = todo.status === "completed";
+                    const readOnly    = isExpired;
+                    return (
                     <div key={todo.id} className={`todo-card status-${todo.status}`}>
+                      {readOnly && <div className="readonly-banner">🔒 {isExpired ? "Expired – Read Only" : "Read Only"}</div>}
                       <div className="todo-card-header">
                         <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
                           <span className="todo-badge" style={{ background: STATUS_COLOR[todo.status] }}>
@@ -646,10 +802,12 @@ export default function App() {
                             </span>
                           )}
                         </div>
+                        {!readOnly && (
                         <div className="todo-actions">
                           <button className="icon-btn" onClick={() => openEdit(todo)} title="Edit">✏️</button>
                           <button className="icon-btn" onClick={() => deleteTodo(todo.id)} title="Delete">🗑️</button>
                         </div>
+                        )}
                       </div>
                       <div className="todo-activity">{todo.activity}</div>
                       <div className="todo-id">ID: {todo.id}</div>
@@ -662,7 +820,7 @@ export default function App() {
                       {todo.comments && <div className="todo-comments">💬 {todo.comments}</div>}
                       <div className="todo-date">Created: {fmtDate(todo.createdDate)}</div>
                     </div>
-                  ))}
+                  );})}
                 </div>
               </>)}
 
@@ -671,7 +829,7 @@ export default function App() {
                 <div className="page-header">
                   <div>
                     <h1 className="page-title">History</h1>
-                    <div className="page-sub">Last 7 days · Read only</div>
+                    <div className="page-sub">Last 7 days · Past tasks read only · Today's tasks editable</div>
                   </div>
                 </div>
                 <div className="history-list">
@@ -701,6 +859,12 @@ export default function App() {
                                   <span className="todo-badge" style={{ background: STATUS_COLOR[todo.status] }}>{STATUS_LABEL[todo.status]}</span>
                                   {todo.priority && <span className="todo-badge" style={{ background: PRIORITY_COLOR[todo.priority] }}>{PRIORITY_LABEL[todo.priority]}</span>}
                                   <span className="hc-id">{todo.id}</span>
+                                  {todo.createdDate === today() && todo.status !== "expired" && (
+                                    <div style={{ marginLeft: "auto", display: "flex", gap: 4 }}>
+                                      <button className="icon-btn" onClick={() => openEdit(todo)} title="Edit">✏️</button>
+                                      <button className="icon-btn" onClick={() => deleteTodo(todo.id)} title="Delete">🗑️</button>
+                                    </div>
+                                  )}
                                 </div>
                                 <div className="hc-activity">{todo.activity}</div>
                                 <div className="todo-meta">
@@ -795,6 +959,77 @@ export default function App() {
             </form>
           </div>
         </div>
+      )}
+
+      {/* ── AI CHATBOT FLOATING BUBBLE ── */}
+      {(page === "todo" || page === "history") && authUser && (
+        <>
+          {/* Bubble */}
+          <button className={`chat-bubble ${chatOpen ? "open" : ""}`} onClick={() => { setChatOpen((o) => !o); setTimeout(() => chatInputRef.current?.focus(), 100); }} title="AI Assistant">
+            {chatOpen ? "✕" : "🤖"}
+          </button>
+
+          {/* Chat Panel */}
+          {chatOpen && (
+            <div className="chat-panel">
+              <div className="chat-header">
+                <div className="chat-header-info">
+                  <span className="chat-avatar">🤖</span>
+                  <div>
+                    <div className="chat-title">TaskNest AI</div>
+                    <div className="chat-subtitle">Powered by Gemini</div>
+                  </div>
+                </div>
+                <button className="chat-close" onClick={() => setChatOpen(false)}>✕</button>
+              </div>
+
+              <div className="chat-messages">
+                {chatMsgs.map((msg, i) => (
+                  <div key={i} className={`chat-msg ${msg.role}`}>
+                    {msg.role === "ai" && <span className="chat-msg-avatar">🤖</span>}
+                    <div className="chat-msg-bubble">
+                      {msg.text.split("\n").map((line, j) => (
+                        <span key={j}>{line}{j < msg.text.split("\n").length - 1 && <br />}</span>
+                      ))}
+                    </div>
+                  </div>
+                ))}
+                {chatLoading && (
+                  <div className="chat-msg ai">
+                    <span className="chat-msg-avatar">🤖</span>
+                    <div className="chat-msg-bubble chat-typing">
+                      <span /><span /><span />
+                    </div>
+                  </div>
+                )}
+                <div ref={chatEndRef} />
+              </div>
+
+              <div className="chat-suggestions">
+                {["What are my tasks today?", "Show high priority tasks", "Summarize my day"].map((s) => (
+                  <button key={s} className="chat-suggestion" onClick={() => { const msg = s; setChatMsgs((prev) => [...prev, { role: "user", text: msg }]); setChatInput(""); setChatLoading(true); fetch(GEMINI_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ system_instruction: { parts: [{ text: buildSystemPrompt() }] }, contents: [{ role: "user", parts: [{ text: msg }] }], generationConfig: { maxOutputTokens: 400, temperature: 0.7 } }) }).then(r => r.json()).then(data => { const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text || "Sorry, I could not understand that."; setChatMsgs((prev) => [...prev, { role: "ai", text: reply }]); }).catch(() => setChatMsgs((prev) => [...prev, { role: "ai", text: "Connection error. Please try again." }])).finally(() => setChatLoading(false)); }}>
+                    {s}
+                  </button>
+                ))}
+              </div>
+
+              <div className="chat-input-row">
+                <input
+                  ref={chatInputRef}
+                  className="chat-input"
+                  value={chatInput}
+                  onChange={(e) => setChatInput(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && handleChatSend()}
+                  placeholder="Ask me anything or create a task..."
+                  disabled={chatLoading}
+                />
+                <button className="chat-send" onClick={handleChatSend} disabled={chatLoading || !chatInput.trim()}>
+                  ➤
+                </button>
+              </div>
+            </div>
+          )}
+        </>
       )}
     </div>
   );
@@ -916,7 +1151,12 @@ body { font-family: 'Lato', sans-serif; }
 .modal-title { font-family:'Caveat',cursive; font-size:1.8rem; color:var(--ink); margin-bottom:22px; border-bottom:2px dashed rgba(139,99,64,0.25); padding-bottom:12px; }
 .todo-form label { display:block; font-size:0.8rem; font-weight:700; text-transform:uppercase; letter-spacing:0.06em; color:var(--ink2); margin-bottom:5px; margin-top:14px; }
 .todo-form input,.todo-form select,.todo-form textarea { width:100%; padding:10px 14px; border:2px solid rgba(139,99,64,0.2); border-radius:10px; font-family:'Lato',sans-serif; font-size:0.95rem; background:rgba(255,255,255,0.8); color:var(--ink); transition:border-color 0.2s; }
-.dark .todo-form input,.dark .todo-form select,.dark .todo-form textarea { background:rgba(255,255,255,0.1); color:var(--ink); }
+.dark .todo-form input,.dark .todo-form select,.dark .todo-form textarea { background:rgba(255,255,255,0.12); color:#e8e0d0; border-color:rgba(200,180,160,0.3); }
+.dark .todo-form input::placeholder,.dark .todo-form textarea::placeholder { color:rgba(232,224,208,0.45); }
+.dark .todo-form input:focus,.dark .todo-form select:focus,.dark .todo-form textarea:focus { background:rgba(255,255,255,0.18); color:#f0e8d8; border-color:var(--accent2); }
+.dark .modal { background:#1e1e2e; }
+.dark .modal-title { color:#f0e8d8; }
+.dark .todo-form label { color:#c0a890; }
 .todo-form input:focus,.todo-form select:focus,.todo-form textarea:focus { outline:none; border-color:var(--accent2); background:#fff; }
 .form-actions { display:flex; gap:12px; margin-top:22px; }
 .form-actions .btn-primary { flex:2; margin-top:0; }
@@ -989,4 +1229,49 @@ body { font-family: 'Lato', sans-serif; }
 
 /* Scrollbar */
 ::-webkit-scrollbar{width:6px} ::-webkit-scrollbar-track{background:rgba(139,99,64,0.05)} ::-webkit-scrollbar-thumb{background:rgba(139,99,64,0.3);border-radius:4px}
+
+/* Read-only banner */
+.readonly-banner{background:rgba(231,76,60,0.1);border:1px solid rgba(231,76,60,0.25);border-radius:8px;padding:5px 10px;font-size:0.75rem;font-weight:700;color:#e74c3c;margin-bottom:10px;text-align:center;letter-spacing:0.04em}
+.dark .readonly-banner{background:rgba(231,76,60,0.15);border-color:rgba(231,76,60,0.35)}
+
+/* Dark mode select options */
+.dark select option { background:#2a2a3e; color:#e8e0d0; }
+
+/* History edit icon in header */
+.hc-top .icon-btn{padding:2px 4px;font-size:0.85rem}
+
+/* ── AI Chatbot ── */
+.chat-bubble{position:fixed;bottom:28px;right:28px;width:56px;height:56px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--accent2));border:none;font-size:1.5rem;cursor:pointer;box-shadow:0 4px 20px rgba(192,57,43,0.45);z-index:998;transition:all 0.2s;display:flex;align-items:center;justify-content:center;color:white;font-weight:700}
+.chat-bubble:hover{transform:scale(1.1);box-shadow:0 8px 28px rgba(192,57,43,0.55)}
+.chat-bubble.open{background:rgba(44,24,16,0.9)}
+.chat-panel{position:fixed;bottom:96px;right:28px;width:360px;height:500px;background:var(--paper);border-radius:20px;box-shadow:0 16px 48px rgba(0,0,0,0.3);z-index:997;display:flex;flex-direction:column;overflow:hidden;border:1px solid rgba(139,99,64,0.15);animation:popIn 0.2s ease}
+.dark .chat-panel{background:#1e1e2e;border-color:rgba(255,255,255,0.1)}
+.chat-header{display:flex;align-items:center;justify-content:space-between;padding:14px 16px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:white;flex-shrink:0}
+.chat-header-info{display:flex;align-items:center;gap:10px}
+.chat-avatar{font-size:1.5rem}
+.chat-title{font-weight:700;font-size:0.95rem}
+.chat-subtitle{font-size:0.72rem;opacity:0.85}
+.chat-close{background:none;border:none;color:white;font-size:1.1rem;cursor:pointer;opacity:0.8;padding:4px;border-radius:6px;transition:opacity 0.15s}
+.chat-close:hover{opacity:1}
+.chat-messages{flex:1;overflow-y:auto;padding:14px;display:flex;flex-direction:column;gap:10px}
+.chat-msg{display:flex;gap:8px;align-items:flex-end}
+.chat-msg.user{flex-direction:row-reverse}
+.chat-msg-avatar{font-size:1.2rem;flex-shrink:0}
+.chat-msg-bubble{max-width:80%;padding:10px 14px;border-radius:16px;font-size:0.88rem;line-height:1.5;word-break:break-word}
+.chat-msg.ai .chat-msg-bubble{background:rgba(139,99,64,0.1);color:var(--ink);border-bottom-left-radius:4px}
+.dark .chat-msg.ai .chat-msg-bubble{background:rgba(255,255,255,0.08);color:var(--ink)}
+.chat-msg.user .chat-msg-bubble{background:linear-gradient(135deg,var(--accent),var(--accent2));color:white;border-bottom-right-radius:4px}
+.chat-typing{display:flex;gap:5px;align-items:center;padding:12px 14px}
+.chat-typing span{width:7px;height:7px;border-radius:50%;background:var(--ink2);animation:bounce 1.2s ease infinite}
+.chat-typing span:nth-child(2){animation-delay:.2s}.chat-typing span:nth-child(3){animation-delay:.4s}
+.chat-suggestions{padding:8px 12px;display:flex;gap:6px;flex-wrap:wrap;flex-shrink:0;border-top:1px solid rgba(139,99,64,0.1)}
+.chat-suggestion{background:rgba(139,99,64,0.08);border:1px solid rgba(139,99,64,0.2);border-radius:20px;padding:5px 12px;font-size:0.75rem;cursor:pointer;color:var(--ink2);font-family:Lato,sans-serif;transition:all 0.15s;white-space:nowrap}
+.chat-suggestion:hover{background:rgba(139,99,64,0.18);color:var(--ink)}
+.chat-input-row{display:flex;gap:8px;padding:12px;border-top:1px solid rgba(139,99,64,0.1);flex-shrink:0}
+.chat-input{flex:1;padding:10px 14px;border:2px solid rgba(139,99,64,0.2);border-radius:12px;font-family:Lato,sans-serif;font-size:0.9rem;background:rgba(255,255,255,0.8);color:var(--ink);outline:none;transition:border-color 0.2s}
+.dark .chat-input{background:rgba(255,255,255,0.08);color:var(--ink)}
+.chat-input:focus{border-color:var(--accent2)}
+.chat-send{background:linear-gradient(135deg,var(--accent),var(--accent2));border:none;border-radius:12px;width:42px;height:42px;cursor:pointer;color:white;font-size:1rem;flex-shrink:0;transition:opacity 0.15s;display:flex;align-items:center;justify-content:center}
+.chat-send:hover{opacity:0.85}
+.chat-send:disabled{opacity:0.4;cursor:not-allowed}
 `;
