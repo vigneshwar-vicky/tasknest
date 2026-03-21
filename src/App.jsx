@@ -17,7 +17,7 @@ import { auth, db } from "./firebase";
 import { sendTaskExpiredEmail } from "./emailService";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-const APP_VERSION = "1.4.0";
+const APP_VERSION = "1.3.0";
 const GEMINI_KEY = "AIzaSyBecGIhzM22sfDXMQ-2ZD8NDmgJRqx43MA";
 const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`;
 const FEEDBACK_EMAIL = "tasknest.application@gmail.com";
@@ -224,65 +224,26 @@ export default function App() {
     return unsub;
   }, [authUser]);
 
-  // ── Notification + Expiry checker ────────────────────────────────────────
+  // ── Expiry checker ────────────────────────────────────────────────────────
   useEffect(() => {
     if (!authUser || !userProfile) return;
     const check = async () => {
       const snap = await getDoc(doc(db, "todos", authUser.uid));
       if (!snap.exists()) return;
       const items = snap.data().items || [];
-      const now  = new Date();
-      const nowM = now.getHours() * 60 + now.getMinutes();
+      const now = new Date();
       let changed = false;
-
       const updated = items.map((t) => {
-        if ((t.status === "new" || t.status === "inprogress") && t.createdDate === today()) {
-          let task = { ...t };
-
-          // 1. Task start email
-          if (t.startTime && !t.notifiedStart) {
-            const startM = timeToMins(t.startTime);
-            if (startM !== null && nowM >= startM) {
-              changed = true;
-              task.notifiedStart = true;
-              sendTaskExpiredEmail(
-                authUser.email,
-                userProfile.firstName,
-                "START: Your task \"" + t.activity + "\" is starting now (" + t.startTime + ")"
-              );
-            }
+        if ((t.status === "new" || t.status === "inprogress") && t.endTime) {
+          const end = new Date(`${today()}T${t.endTime}`);
+          if (now > end) {
+            changed = true;
+            sendTaskExpiredEmail(authUser.email, userProfile.firstName, t.activity);
+            return { ...t, status: "expired", comments: (t.comments || "") + (t.comments ? "\n" : "") + "Task not completed on time" };
           }
-
-          // 2. 10-min end warning email
-          if (t.endTime && !t.notifiedEndWarning) {
-            const endM = timeToMins(t.endTime);
-            if (endM !== null && nowM >= endM - 10 && nowM < endM) {
-              changed = true;
-              task.notifiedEndWarning = true;
-              sendTaskExpiredEmail(
-                authUser.email,
-                userProfile.firstName,
-                "WARNING: Your task \"" + t.activity + "\" ends in 10 minutes (" + t.endTime + ")"
-              );
-            }
-          }
-
-          // 3. Task expired
-          if (t.endTime) {
-            const end = new Date(today() + "T" + t.endTime);
-            if (now > end && task.status !== "expired") {
-              changed = true;
-              task.status   = "expired";
-              task.comments = (t.comments || "") + (t.comments ? "\n" : "") + "Task not completed on time";
-              sendTaskExpiredEmail(authUser.email, userProfile.firstName, t.activity);
-            }
-          }
-
-          return task;
         }
         return t;
       });
-
       if (changed) await setDoc(doc(db, "todos", authUser.uid), { items: updated });
     };
     check();
@@ -461,7 +422,7 @@ For all other queries, respond in a friendly, concise way. Use emojis sparingly.
         {
           to_name:   "TaskNest Team",
           to_email:  FEEDBACK_EMAIL,
-          task_name: `[FEEDBACK] From: ${userProfile?.firstName} ${userProfile?.lastName} (${authUser?.email}) | Message: ${feedbackText}`,
+          task_name: `Feedback from ${userProfile?.firstName} ${userProfile?.lastName}`,
           message:   feedbackText,
         },
         "8GpnlxYEEPYtypCL0"
@@ -549,7 +510,6 @@ For all other queries, respond in a friendly, concise way. Use emojis sparingly.
   const [expanded, setExpanded] = useState({});
   const days = last7();
   const grouped = days.reduce((acc, d) => { acc[d] = todos.filter((t) => t.createdDate === d); return acc; }, {});
-  const todayTodos    = todos.filter((t) => t.createdDate === today());
   const daysWithTasks = [...days].reverse().filter((d) => grouped[d]?.length > 0 || d === today());
 
   // ── Loading ───────────────────────────────────────────────────────────────
@@ -776,21 +736,16 @@ For all other queries, respond in a friendly, concise way. Use emojis sparingly.
                   </div>
                 )}
 
-                {/* Todo Cards - today only */}
+                {/* Todo Cards */}
                 <div className="todos-grid">
-                  {todayTodos.length === 0 && (
+                  {todos.length === 0 && (
                     <div className="empty-state">
                       <div className="empty-icon">📝</div>
-                      <div>No tasks for today. Create your first task!</div>
+                      <div>No tasks yet. Create your first task!</div>
                     </div>
                   )}
-                  {todayTodos.map((todo) => {
-                    const isExpired   = todo.status === "expired";
-                    const isCompleted = todo.status === "completed";
-                    const readOnly    = isExpired;
-                    return (
+                  {todos.map((todo) => (
                     <div key={todo.id} className={`todo-card status-${todo.status}`}>
-                      {readOnly && <div className="readonly-banner">🔒 {isExpired ? "Expired – Read Only" : "Read Only"}</div>}
                       <div className="todo-card-header">
                         <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
                           <span className="todo-badge" style={{ background: STATUS_COLOR[todo.status] }}>
@@ -802,12 +757,10 @@ For all other queries, respond in a friendly, concise way. Use emojis sparingly.
                             </span>
                           )}
                         </div>
-                        {!readOnly && (
                         <div className="todo-actions">
                           <button className="icon-btn" onClick={() => openEdit(todo)} title="Edit">✏️</button>
                           <button className="icon-btn" onClick={() => deleteTodo(todo.id)} title="Delete">🗑️</button>
                         </div>
-                        )}
                       </div>
                       <div className="todo-activity">{todo.activity}</div>
                       <div className="todo-id">ID: {todo.id}</div>
@@ -820,7 +773,7 @@ For all other queries, respond in a friendly, concise way. Use emojis sparingly.
                       {todo.comments && <div className="todo-comments">💬 {todo.comments}</div>}
                       <div className="todo-date">Created: {fmtDate(todo.createdDate)}</div>
                     </div>
-                  );})}
+                  ))}
                 </div>
               </>)}
 
@@ -829,7 +782,7 @@ For all other queries, respond in a friendly, concise way. Use emojis sparingly.
                 <div className="page-header">
                   <div>
                     <h1 className="page-title">History</h1>
-                    <div className="page-sub">Last 7 days · Past tasks read only · Today's tasks editable</div>
+                    <div className="page-sub">Last 7 days · Read only</div>
                   </div>
                 </div>
                 <div className="history-list">
@@ -859,12 +812,6 @@ For all other queries, respond in a friendly, concise way. Use emojis sparingly.
                                   <span className="todo-badge" style={{ background: STATUS_COLOR[todo.status] }}>{STATUS_LABEL[todo.status]}</span>
                                   {todo.priority && <span className="todo-badge" style={{ background: PRIORITY_COLOR[todo.priority] }}>{PRIORITY_LABEL[todo.priority]}</span>}
                                   <span className="hc-id">{todo.id}</span>
-                                  {todo.createdDate === today() && todo.status !== "expired" && (
-                                    <div style={{ marginLeft: "auto", display: "flex", gap: 4 }}>
-                                      <button className="icon-btn" onClick={() => openEdit(todo)} title="Edit">✏️</button>
-                                      <button className="icon-btn" onClick={() => deleteTodo(todo.id)} title="Delete">🗑️</button>
-                                    </div>
-                                  )}
                                 </div>
                                 <div className="hc-activity">{todo.activity}</div>
                                 <div className="todo-meta">
@@ -1151,12 +1098,7 @@ body { font-family: 'Lato', sans-serif; }
 .modal-title { font-family:'Caveat',cursive; font-size:1.8rem; color:var(--ink); margin-bottom:22px; border-bottom:2px dashed rgba(139,99,64,0.25); padding-bottom:12px; }
 .todo-form label { display:block; font-size:0.8rem; font-weight:700; text-transform:uppercase; letter-spacing:0.06em; color:var(--ink2); margin-bottom:5px; margin-top:14px; }
 .todo-form input,.todo-form select,.todo-form textarea { width:100%; padding:10px 14px; border:2px solid rgba(139,99,64,0.2); border-radius:10px; font-family:'Lato',sans-serif; font-size:0.95rem; background:rgba(255,255,255,0.8); color:var(--ink); transition:border-color 0.2s; }
-.dark .todo-form input,.dark .todo-form select,.dark .todo-form textarea { background:rgba(255,255,255,0.12); color:#e8e0d0; border-color:rgba(200,180,160,0.3); }
-.dark .todo-form input::placeholder,.dark .todo-form textarea::placeholder { color:rgba(232,224,208,0.45); }
-.dark .todo-form input:focus,.dark .todo-form select:focus,.dark .todo-form textarea:focus { background:rgba(255,255,255,0.18); color:#f0e8d8; border-color:var(--accent2); }
-.dark .modal { background:#1e1e2e; }
-.dark .modal-title { color:#f0e8d8; }
-.dark .todo-form label { color:#c0a890; }
+.dark .todo-form input,.dark .todo-form select,.dark .todo-form textarea { background:rgba(255,255,255,0.1); color:var(--ink); }
 .todo-form input:focus,.todo-form select:focus,.todo-form textarea:focus { outline:none; border-color:var(--accent2); background:#fff; }
 .form-actions { display:flex; gap:12px; margin-top:22px; }
 .form-actions .btn-primary { flex:2; margin-top:0; }
@@ -1212,33 +1154,61 @@ body { font-family: 'Lato', sans-serif; }
 .hc-activity{font-family:'Caveat',cursive;font-size:1.1rem;font-weight:700;color:var(--ink);margin-bottom:6px}
 
 /* TimePicker */
-.tp-wrap{position:relative} .tp-field{display:flex;align-items:center;border:2px solid rgba(139,99,64,0.2);border-radius:10px;background:rgba(255,255,255,0.8);cursor:pointer;transition:border-color 0.2s} .tp-field:hover{border-color:var(--accent2)}
-.tp-clock{padding:10px 10px 10px 12px;font-size:1rem} .tp-input{flex:1;border:none!important;background:transparent!important;cursor:pointer;padding:10px 14px 10px 0!important;color:var(--ink)}
-.tp-popup{position:absolute;top:110%;left:0;background:var(--paper);border-radius:14px;padding:18px;box-shadow:0 8px 32px rgba(0,0,0,0.25);z-index:300;min-width:220px;border:1px solid rgba(139,99,64,0.15)}
-.tp-title{font-family:'Caveat',cursive;font-size:1.05rem;color:var(--ink);margin-bottom:12px}
-.tp-row{display:flex;align-items:center;gap:8px;margin-bottom:12px} .tp-row button{background:rgba(139,99,64,0.1);border:none;border-radius:6px;width:28px;height:28px;cursor:pointer;font-size:1rem;color:var(--ink2);transition:background 0.15s} .tp-row button:hover{background:rgba(139,99,64,0.22)}
-.tp-num{width:46px;text-align:center;border:2px solid rgba(139,99,64,0.2);border-radius:8px;padding:4px;font-size:1rem;font-weight:700;color:var(--ink);background:white} .tp-num:focus{outline:none;border-color:var(--accent2)}
-.tp-colon{font-size:1.3rem;font-weight:700;color:var(--ink2)} .tp-ampm{display:flex;gap:8px;margin-bottom:12px}
-.tp-ampm button{flex:1;padding:7px;border:2px solid rgba(139,99,64,0.2);border-radius:8px;background:transparent;cursor:pointer;font-weight:700;color:var(--ink2);transition:all 0.15s} .tp-ampm button.active{background:var(--accent2);color:white;border-color:var(--accent2)}
-.tp-ok{width:100%;padding:9px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:white;border:none;border-radius:10px;cursor:pointer;font-weight:700;font-family:'Lato',sans-serif;transition:opacity 0.15s} .tp-ok:hover{opacity:0.9}
+.tp-wrap{position:relative}
+.tp-field{display:flex;align-items:center;border:2px solid rgba(139,99,64,0.25);border-radius:10px;background:#fff;cursor:pointer;transition:border-color 0.2s}
+.tp-field:hover{border-color:var(--accent2)}
+.tp-clock{padding:10px 10px 10px 12px;font-size:1rem;color:#5C4033}
+.tp-input{flex:1;border:none!important;background:transparent!important;cursor:pointer;padding:10px 14px 10px 0!important;color:#2C1810;font-family:Lato,sans-serif;font-size:0.95rem}
+.tp-popup{position:absolute;top:110%;left:0;background:#FDFAF2;border-radius:14px;padding:18px;box-shadow:0 8px 32px rgba(0,0,0,0.25);z-index:400;min-width:220px;border:1px solid rgba(139,99,64,0.2)}
+.tp-title{font-family:'Caveat',cursive;font-size:1.05rem;color:#2C1810;margin-bottom:12px}
+.tp-row{display:flex;align-items:center;gap:8px;margin-bottom:12px}
+.tp-row button{background:rgba(139,99,64,0.12);border:none;border-radius:6px;width:28px;height:28px;cursor:pointer;font-size:1rem;color:#5C4033;transition:background 0.15s}
+.tp-row button:hover{background:rgba(139,99,64,0.25)}
+.tp-num{width:46px;text-align:center;border:2px solid rgba(139,99,64,0.2);border-radius:8px;padding:4px;font-size:1rem;font-weight:700;color:#2C1810;background:#fff}
+.tp-num:focus{outline:none;border-color:var(--accent2)}
+.tp-colon{font-size:1.3rem;font-weight:700;color:#5C4033}
+.tp-ampm{display:flex;gap:8px;margin-bottom:12px}
+.tp-ampm button{flex:1;padding:7px;border:2px solid rgba(139,99,64,0.2);border-radius:8px;background:transparent;cursor:pointer;font-weight:700;color:#5C4033;transition:all 0.15s}
+.tp-ampm button.active{background:var(--accent2);color:#fff;border-color:var(--accent2)}
+.tp-ok{width:100%;padding:9px;background:linear-gradient(135deg,var(--accent),var(--accent2));color:#fff;border:none;border-radius:10px;cursor:pointer;font-weight:700;font-family:Lato,sans-serif;transition:opacity 0.15s}
+.tp-ok:hover{opacity:0.9}
+/* TimePicker dark mode */
+.dark .tp-field{background:#2a2a3e;border-color:rgba(200,180,160,0.3)}
+.dark .tp-field:hover{border-color:var(--accent2)}
+.dark .tp-clock{color:#c0a890}
+.dark .tp-input{color:#e8e0d0}
+.dark .tp-popup{background:#2a2a3e;border-color:rgba(200,180,160,0.2);box-shadow:0 8px 32px rgba(0,0,0,0.5)}
+.dark .tp-title{color:#f0e8d8}
+.dark .tp-row button{background:rgba(255,255,255,0.1);color:#c0a890}
+.dark .tp-row button:hover{background:rgba(255,255,255,0.2)}
+.dark .tp-num{background:#1e1e2e;color:#f0e8d8;border-color:rgba(200,180,160,0.3)}
+.dark .tp-colon{color:#c0a890}
+.dark .tp-ampm button{color:#c0a890;border-color:rgba(200,180,160,0.2)}
+.dark .tp-ampm button.active{background:var(--accent2);color:#fff}
 
-/* Toast */
-.toast{position:fixed;bottom:28px;right:28px;background:var(--ink);color:var(--cream);padding:13px 22px;border-radius:12px;font-size:0.9rem;font-weight:600;z-index:999;box-shadow:0 6px 24px rgba(0,0,0,0.35);animation:slideUp 0.3s ease;border-left:4px solid var(--green);max-width:380px;line-height:1.5}
-.toast.error{border-left-color:#e74c3c}
+/* Toast - fixed colors for both light and dark themes */
+.toast{
+  position:fixed;bottom:28px;right:28px;
+  background:#1a0f0a;
+  color:#F5EDD8;
+  padding:14px 22px;border-radius:14px;
+  font-size:0.9rem;font-weight:600;font-family:Lato,sans-serif;
+  z-index:9999;
+  box-shadow:0 8px 28px rgba(0,0,0,0.45);
+  animation:slideUp 0.3s ease;
+  border-left:4px solid #27AE60;
+  max-width:400px;line-height:1.55;
+  word-break:break-word;
+}
+.toast.error{border-left-color:#e74c3c;background:#1a0505;color:#ffeaea}
+.toast.warning{border-left-color:#f5a623;background:#1a1005;color:#fff3d0}
+.dark .toast{background:#0d0d1a;color:#e8e0d0;box-shadow:0 8px 28px rgba(0,0,0,0.7)}
+.dark .toast.error{background:#1a0505;color:#ffc5c5}
+.dark .toast.warning{background:#1a1200;color:#ffe5a0}
 @keyframes slideUp{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
 
 /* Scrollbar */
 ::-webkit-scrollbar{width:6px} ::-webkit-scrollbar-track{background:rgba(139,99,64,0.05)} ::-webkit-scrollbar-thumb{background:rgba(139,99,64,0.3);border-radius:4px}
-
-/* Read-only banner */
-.readonly-banner{background:rgba(231,76,60,0.1);border:1px solid rgba(231,76,60,0.25);border-radius:8px;padding:5px 10px;font-size:0.75rem;font-weight:700;color:#e74c3c;margin-bottom:10px;text-align:center;letter-spacing:0.04em}
-.dark .readonly-banner{background:rgba(231,76,60,0.15);border-color:rgba(231,76,60,0.35)}
-
-/* Dark mode select options */
-.dark select option { background:#2a2a3e; color:#e8e0d0; }
-
-/* History edit icon in header */
-.hc-top .icon-btn{padding:2px 4px;font-size:0.85rem}
 
 /* ── AI Chatbot ── */
 .chat-bubble{position:fixed;bottom:28px;right:28px;width:56px;height:56px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--accent2));border:none;font-size:1.5rem;cursor:pointer;box-shadow:0 4px 20px rgba(192,57,43,0.45);z-index:998;transition:all 0.2s;display:flex;align-items:center;justify-content:center;color:white;font-weight:700}
@@ -1259,17 +1229,19 @@ body { font-family: 'Lato', sans-serif; }
 .chat-msg-avatar{font-size:1.2rem;flex-shrink:0}
 .chat-msg-bubble{max-width:80%;padding:10px 14px;border-radius:16px;font-size:0.88rem;line-height:1.5;word-break:break-word}
 .chat-msg.ai .chat-msg-bubble{background:rgba(139,99,64,0.1);color:var(--ink);border-bottom-left-radius:4px}
-.dark .chat-msg.ai .chat-msg-bubble{background:rgba(255,255,255,0.08);color:var(--ink)}
+.dark .chat-msg.ai .chat-msg-bubble{background:rgba(255,255,255,0.1);color:#e8e0d0}
 .chat-msg.user .chat-msg-bubble{background:linear-gradient(135deg,var(--accent),var(--accent2));color:white;border-bottom-right-radius:4px}
 .chat-typing{display:flex;gap:5px;align-items:center;padding:12px 14px}
 .chat-typing span{width:7px;height:7px;border-radius:50%;background:var(--ink2);animation:bounce 1.2s ease infinite}
 .chat-typing span:nth-child(2){animation-delay:.2s}.chat-typing span:nth-child(3){animation-delay:.4s}
 .chat-suggestions{padding:8px 12px;display:flex;gap:6px;flex-wrap:wrap;flex-shrink:0;border-top:1px solid rgba(139,99,64,0.1)}
-.chat-suggestion{background:rgba(139,99,64,0.08);border:1px solid rgba(139,99,64,0.2);border-radius:20px;padding:5px 12px;font-size:0.75rem;cursor:pointer;color:var(--ink2);font-family:Lato,sans-serif;transition:all 0.15s;white-space:nowrap}
+.chat-suggestion{background:rgba(139,99,64,0.1);border:1px solid rgba(139,99,64,0.25);border-radius:20px;padding:5px 12px;font-size:0.75rem;cursor:pointer;color:#5C4033;font-family:Lato,sans-serif;transition:all 0.15s;white-space:nowrap}
+.dark .chat-suggestion{background:rgba(255,255,255,0.08);border-color:rgba(255,255,255,0.15);color:#c0a890}
+.dark .chat-suggestion:hover{background:rgba(255,255,255,0.15);color:#e8e0d0}
 .chat-suggestion:hover{background:rgba(139,99,64,0.18);color:var(--ink)}
 .chat-input-row{display:flex;gap:8px;padding:12px;border-top:1px solid rgba(139,99,64,0.1);flex-shrink:0}
 .chat-input{flex:1;padding:10px 14px;border:2px solid rgba(139,99,64,0.2);border-radius:12px;font-family:Lato,sans-serif;font-size:0.9rem;background:rgba(255,255,255,0.8);color:var(--ink);outline:none;transition:border-color 0.2s}
-.dark .chat-input{background:rgba(255,255,255,0.08);color:var(--ink)}
+.dark .chat-input{background:rgba(255,255,255,0.08);color:#e8e0d0;border-color:rgba(200,180,160,0.3)}
 .chat-input:focus{border-color:var(--accent2)}
 .chat-send{background:linear-gradient(135deg,var(--accent),var(--accent2));border:none;border-radius:12px;width:42px;height:42px;cursor:pointer;color:white;font-size:1rem;flex-shrink:0;transition:opacity 0.15s;display:flex;align-items:center;justify-content:center}
 .chat-send:hover{opacity:0.85}
