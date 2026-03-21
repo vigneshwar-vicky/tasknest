@@ -19,7 +19,7 @@ import { sendTaskExpiredEmail } from "./emailService";
 // ─── Constants ────────────────────────────────────────────────────────────────
 const APP_VERSION = "1.3.0";
 const GEMINI_KEY = import.meta.env.VITE_GEMINI;
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_KEY}`;
+const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_KEY}`;
 const FEEDBACK_EMAIL = "tasknest.application@gmail.com";
 
 const PRIORITY_DEFAULTS = { high: 60, medium: 240, low: 480 };
@@ -295,94 +295,107 @@ export default function App() {
     }
   }, [chatMsgs, chatOpen]);
 
-  const buildSystemPrompt = () => {
-    const activeTodos = todos.filter((t) => t.status === "new" || t.status === "inprogress");
-    const completedToday = todos.filter((t) => t.status === "completed" && t.createdDate === today());
-    const expired = todos.filter((t) => t.status === "expired");
-    const high = todos.filter((t) => t.priority === "high" && (t.status === "new" || t.status === "inprogress"));
-    return `You are a smart AI assistant embedded in TaskNest, a todo app. The user is ${userProfile?.firstName} ${userProfile?.lastName}.
-
-CURRENT TASKS (today: ${today()}):
-${todos.length === 0 ? "No tasks yet." : todos.map((t) => `- [${t.status.toUpperCase()}][${(t.priority || "medium").toUpperCase()}] "${t.activity}" | Est: ${t.estimateTime}mins | Start: ${t.startTime || "N/A"} | End: ${t.endTime || "N/A"} | ID: ${t.id}`).join("\n")}
-
-SUMMARY: ${activeTodos.length} active, ${completedToday.length} completed today, ${expired.length} expired, ${high.length} high priority pending.
-
-CAPABILITIES:
-1. Answer questions about tasks
-2. Summarize productivity
-3. Create tasks by responding with JSON
-
-TASK CREATION: When user wants to create a task, respond with ONLY this JSON (no other text):
-{"action":"create_task","activity":"task name","priority":"high|medium|low","status":"new","estimateTime":"60","startTime":"09:00","endTime":"10:00","comments":""}
-
-Rules for task creation:
-- Parse natural language for time (e.g. "9am" = "09:00", "2:30pm" = "14:30")  
-- If no time given, leave startTime and endTime as ""
-- If no priority given, default to "medium"
-- estimateTime in minutes: high=60, medium=240, low=480 unless specified
-- Only return the JSON, nothing else, when creating a task
-
-For all other queries, respond in a friendly, concise way. Use emojis sparingly. Keep responses under 150 words.`;
-  };
-
-  const handleChatSend = async () => {
-    const msg = chatInput.trim();
+  const handleChatSend = async (quickMsg) => {
+    const msg = (quickMsg !== undefined ? quickMsg : chatInput).trim();
     if (!msg || chatLoading) return;
     setChatInput("");
     setChatMsgs((prev) => [...prev, { role: "user", text: msg }]);
     setChatLoading(true);
     try {
-      const history = chatMsgs
-        .filter((m) => m.role !== "ai" || chatMsgs.indexOf(m) > 0)
-        .map((m) => ({
-          role: m.role === "user" ? "user" : "model",
-          parts: [{ text: m.text }],
-        }));
+      const active    = todos.filter((t) => t.status === "new" || t.status === "inprogress");
+      const done      = todos.filter((t) => t.status === "completed" && t.createdDate === today());
+      const expired   = todos.filter((t) => t.status === "expired");
+      const taskList  = todos.length === 0
+        ? "No tasks."
+        : todos.map((t) =>
+            "• [" + t.status.toUpperCase() + "][" + (t.priority||"medium").toUpperCase() + "] "
+            + t.activity + " | Est:" + t.estimateTime + "min"
+            + " Start:" + (t.startTime||"-") + " End:" + (t.endTime||"-")
+          ).join("\n");
+
+      const taskJsonExample = JSON.stringify({
+        action:"create_task", activity:"Task name",
+        priority:"high", estimateTime:"60",
+        startTime:"09:00", endTime:"10:00", comments:""
+      });
+
+      const prompt =
+        "You are TaskNest AI, a smart task assistant. "
+        + "User: " + (userProfile?.firstName||"User") + ". Today: " + today() + ".\n\n"
+        + "TASKS:\n" + taskList + "\n\n"
+        + "STATS: Active=" + active.length + " Done=" + done.length + " Expired=" + expired.length + "\n\n"
+        + "RULES:\n"
+        + "1. Answer task questions helpfully.\n"
+        + "2. If user wants to CREATE a task, reply with ONLY this JSON (nothing else):\n"
+        + taskJsonExample + "\n"
+        + "3. Time: 9am=09:00 2pm=14:00 10pm=22:00. No time given = empty string.\n"
+        + "4. Priority: high=60min medium=240min low=480min.\n"
+        + "5. All other queries: reply max 80 words, friendly and concise.\n\n"
+        + "User: " + msg;
+
       const res = await fetch(GEMINI_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          system_instruction: { parts: [{ text: buildSystemPrompt() }] },
-          contents: [...history, { role: "user", parts: [{ text: msg }] }],
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
           generationConfig: { maxOutputTokens: 400, temperature: 0.7 },
         }),
       });
-      const data = await res.json();
-      const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text || "Sorry, I couldn't understand that. Try again!";
 
-      // Check if AI wants to create a task
-      const trimmed = reply.trim();
-      if (trimmed.startsWith("{") && trimmed.includes("action") && trimmed.includes("create_task")) {
+      const data = await res.json();
+
+      if (data.error) {
+        setChatMsgs((prev) => [...prev, { role: "ai", text: "⚠️ " + data.error.message }]);
+        return;
+      }
+
+      const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      if (!reply) {
+        setChatMsgs((prev) => [...prev, { role: "ai", text: "⚠️ No response. Try again." }]);
+        return;
+      }
+
+      // Detect task creation JSON
+      const jm = reply.trim().match(/\{[\s\S]*?\}/);
+      if (jm) {
         try {
-          const parsed = JSON.parse(trimmed);
-          if (parsed.action === "create_task" && parsed.activity) {
-            const conflict = checkConflict(parsed, todos);
+          const p = JSON.parse(jm[0]);
+          if (p.action === "create_task" && p.activity) {
+            const conflict = checkConflict(p, todos);
             if (conflict) {
-              setChatMsgs((prev) => [...prev, { role: "ai", text: `⚠️ I couldn't create the task because it conflicts with "${conflict.activity}" (${conflict.startTime} – ${conflict.endTime}). Please choose a different time!` }]);
+              setChatMsgs((prev) => [...prev, { role: "ai",
+                text: "⚠️ Time conflict with \"" + conflict.activity + "\" (" + conflict.startTime + "–" + conflict.endTime + "). Choose a different time!"
+              }]);
             } else {
               const newTodo = {
-                activity:     parsed.activity,
-                priority:     parsed.priority || "medium",
+                activity:     p.activity,
+                priority:     p.priority     || "medium",
                 status:       "new",
-                estimateTime: parsed.estimateTime || String(PRIORITY_DEFAULTS[parsed.priority || "medium"]),
-                startTime:    parsed.startTime || "",
-                endTime:      parsed.endTime || "",
+                estimateTime: p.estimateTime || String(PRIORITY_DEFAULTS[p.priority || "medium"]),
+                startTime:    p.startTime    || "",
+                endTime:      p.endTime      || "",
                 actualTime:   "",
-                comments:     parsed.comments || "",
+                comments:     p.comments     || "",
                 id:           genId(),
                 createdDate:  today(),
                 createdAt:    new Date().toISOString(),
               };
               await saveTodos([...todos, newTodo]);
-              setChatMsgs((prev) => [...prev, { role: "ai", text: `✅ Task created successfully!\n\n📌 **${newTodo.activity}**\n🎯 Priority: ${PRIORITY_LABEL[newTodo.priority]}\n⏱ Estimate: ${newTodo.estimateTime} mins${newTodo.startTime ? `\n🕐 ${newTodo.startTime} – ${newTodo.endTime}` : ""}` }]);
+              setChatMsgs((prev) => [...prev, { role: "ai",
+                text: "✅ Task created!\n📌 " + newTodo.activity
+                  + "\n🎯 " + PRIORITY_LABEL[newTodo.priority]
+                  + " | ⏱ " + newTodo.estimateTime + " mins"
+                  + (newTodo.startTime ? " | 🕐 " + newTodo.startTime + "–" + newTodo.endTime : "")
+                  + "\n\nCheck your Todo List!"
+              }]);
             }
             return;
           }
-        } catch { /* not valid JSON, treat as normal reply */ }
+        } catch (_) {}
       }
       setChatMsgs((prev) => [...prev, { role: "ai", text: reply }]);
-    } catch {
-      setChatMsgs((prev) => [...prev, { role: "ai", text: "⚠️ Something went wrong. Check your connection and try again." }]);
+    } catch (err) {
+      setChatMsgs((prev) => [...prev, { role: "ai", text: "⚠️ Network error. Try again." }]);
     } finally {
       setChatLoading(false);
     }
@@ -953,8 +966,8 @@ For all other queries, respond in a friendly, concise way. Use emojis sparingly.
               </div>
 
               <div className="chat-suggestions">
-                {["What are my tasks today?", "Show high priority tasks", "Summarize my day"].map((s) => (
-                  <button key={s} className="chat-suggestion" onClick={() => { const msg = s; setChatMsgs((prev) => [...prev, { role: "user", text: msg }]); setChatInput(""); setChatLoading(true); fetch(GEMINI_URL, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ system_instruction: { parts: [{ text: buildSystemPrompt() }] }, contents: [{ role: "user", parts: [{ text: msg }] }], generationConfig: { maxOutputTokens: 400, temperature: 0.7 } }) }).then(r => r.json()).then(data => { const reply = data?.candidates?.[0]?.content?.parts?.[0]?.text || "Sorry, I could not understand that."; setChatMsgs((prev) => [...prev, { role: "ai", text: reply }]); }).catch(() => setChatMsgs((prev) => [...prev, { role: "ai", text: "Connection error. Please try again." }])).finally(() => setChatLoading(false)); }}>
+                {["What are my tasks today?", "Show high priority tasks", "Summarize my day", "Create a task for me"].map((s) => (
+                  <button key={s} className="chat-suggestion" onClick={() => handleChatSend(s)}>
                     {s}
                   </button>
                 ))}
@@ -966,11 +979,11 @@ For all other queries, respond in a friendly, concise way. Use emojis sparingly.
                   className="chat-input"
                   value={chatInput}
                   onChange={(e) => setChatInput(e.target.value)}
-                  onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && handleChatSend()}
+                  onKeyDown={(e) => e.key === "Enter" && !e.shiftKey && handleChatSend(undefined)}
                   placeholder="Ask me anything or create a task..."
                   disabled={chatLoading}
                 />
-                <button className="chat-send" onClick={handleChatSend} disabled={chatLoading || !chatInput.trim()}>
+                <button className="chat-send" onClick={() => handleChatSend(undefined)} disabled={chatLoading || !chatInput.trim()}>
                   ➤
                 </button>
               </div>
